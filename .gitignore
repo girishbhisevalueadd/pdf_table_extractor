@@ -1,0 +1,102 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+pdfenv/
+venv/
+env/
+.venv/
+.env_local/
+ENV/
+env.bak/
+venv.bak/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+*.csv
+*.docx
+*.xlsm
+*.xlsx
+
+
+
+# ── Jupyter / IPython ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Distribution / build ──────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+MANIFEST
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+
+# ── Type checkers / linters ───────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+.pyre/
+.ruff_cache/
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.sublime-project
+*.sublime-workspace
+
+# ── OS generated ──────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Temporary / output files ──────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ── Extracted tables output ───────────────────────────────────────────────────
+extracted_tables/
+output/
+
+# ── Sample PDFs (large binary files — keep out of version control) ────────────
+# Comment out the line below if you DO want sample files tracked
+Sample_files/
+
+# ── Streamlit ─────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
