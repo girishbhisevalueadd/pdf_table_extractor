@@ -544,6 +544,38 @@ Extract ALL tables with extremely high accuracy and properly formatted unique he
 
 # Now add this modified function to replace your call_anthropic_api function
 
+def _anthropic_post_with_retry(headers, payload, max_retries=5):
+    """
+    POST to the Anthropic messages endpoint with exponential backoff on 529 (overloaded)
+    and 529-class transient errors.
+
+    Retry delays: 10 s → 20 s → 40 s → 80 s → 160 s
+    Returns the requests.Response object on success or last failure.
+    """
+    base_delay = 10  # seconds
+    for attempt in range(max_retries):
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=180,
+        )
+        if response.status_code != 529:
+            return response
+        wait = base_delay * (2 ** attempt)
+        app_logger.warning(
+            f"_anthropic_post_with_retry | 529 Overloaded | attempt={attempt+1}/{max_retries} "
+            f"| waiting {wait}s before retry"
+        )
+        st.warning(
+            f"Anthropic API overloaded (attempt {attempt+1}/{max_retries}). "
+            f"Retrying in {wait}s…"
+        )
+        time.sleep(wait)
+    # Return last response (still 529) so caller can handle it
+    return response
+
+
 def call_anthropic_api(prompt, pdf_text, ocr_text=None, image=None):
     """Call Anthropic API with direct HTTP requests instead of using the client."""
     _t0 = time.time()
@@ -629,13 +661,8 @@ Example:
                     ]
                 }
                 
-                response = requests.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=headers,
-                    json=payload,
-                    timeout=180  # 3 minutes timeout
-                )
-                
+                response = _anthropic_post_with_retry(headers, payload)
+
                 if response.status_code == 200:
                     result_text = response.json()["content"][0]["text"]
                     app_logger.info(
@@ -709,13 +736,8 @@ Output ONLY the extracted tables in markdown format. No explanations or commenta
                 ]
             }
             
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload,
-                timeout=180  # 3 minutes timeout
-            )
-            
+            response = _anthropic_post_with_retry(headers, payload)
+
             if response.status_code == 200:
                 result_text = response.json()["content"][0]["text"]
                 app_logger.info(
@@ -1302,7 +1324,13 @@ with st.container():
             tmp_file.write(uploaded_file.getvalue())
             pdf_path = tmp_file.name
         app_logger.debug(f"PDF saved to temp file: {pdf_path}")
-        
+
+        # Clear stale results whenever a different file is uploaded
+        if st.session_state.get('_last_uploaded_file') != uploaded_file.name:
+            for _k in [k for k in list(st.session_state.keys()) if k.startswith(('trad_', 'llm_'))]:
+                del st.session_state[_k]
+            st.session_state['_last_uploaded_file'] = uploaded_file.name
+
         # TABS for different extraction methods
         tab1, tab2 = st.tabs(["Traditional Extraction", "LLM-Based Extraction"])
         
@@ -1336,137 +1364,129 @@ with st.container():
             
             # Extract tables button
             extract_button = st.button("Extract Tables")
-            
+
             if extract_button:
-                # Show progress
+                # Clear previous traditional results
+                st.session_state.pop('trad_results', None)
+
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
-                # Status updates
+
                 status_text.text("Initializing table extractor...")
                 progress_bar.progress(10)
-                
-                # Initialize the extractor with selected options
+
                 extractor = PDFTableExtractor(
                     use_ocr=use_ocr,
                     ocr_lang=ocr_language,
                     dpi=dpi,
                     confidence_threshold=confidence_threshold
                 )
-                
-                # Status update
+
                 status_text.text("Analyzing PDF structure...")
                 progress_bar.progress(20)
-                
-                # Analyze PDF
+
                 pdf_info = extractor.analyze_pdf(pdf_path)
-                
-                # Status update
+
                 status_text.text(f"PDF has {pdf_info['pages']} pages. " +
                                 (f"Document appears to be {'scanned' if pdf_info['is_scanned'] else 'text-based'}. " if 'is_scanned' in pdf_info else ""))
                 progress_bar.progress(30)
-                
-                # Status update
+
                 status_text.text("Extracting tables from PDF...")
                 progress_bar.progress(40)
-                
-                # Extract tables
+
                 start_time = time.time()
                 tables_dict = extractor.extract_tables(pdf_path, pages=pages_to_process)
                 extraction_time = time.time() - start_time
-                
-                # Status update
+
                 status_text.text("Post-processing extracted tables...")
                 progress_bar.progress(70)
-                
-                # Status update
                 status_text.text("Extraction complete!")
                 progress_bar.progress(100)
-                
-                # Display extraction summary
-                st.success(f"Extraction completed in {extraction_time:.2f} seconds")
-                
-                # Count total tables extracted
-                total_tables = sum(len(tables) for tables in tables_dict.values())
-                st.write(f"**Total tables extracted:** {total_tables}")
-                
-                if total_tables > 0:
-                    # Create tabs for visualization and download
+
+                total_tables = sum(len(tbls) for tbls in tables_dict.values())
+                # Persist results so download-button reruns don't lose the data
+                st.session_state['trad_results'] = {
+                    'tables_dict': tables_dict,
+                    'total_tables': total_tables,
+                    'extraction_time': extraction_time,
+                }
+
+            # ── Display persisted Traditional results (survives download-button reruns) ──
+            if 'trad_results' in st.session_state:
+                _r = st.session_state['trad_results']
+                _tables_dict  = _r['tables_dict']
+                _total_tables = _r['total_tables']
+                _ext_time     = _r['extraction_time']
+
+                st.success(f"Extraction completed in {_ext_time:.2f} seconds")
+                st.write(f"**Total tables extracted:** {_total_tables}")
+
+                if _total_tables > 0:
                     view_tab, download_tab = st.tabs(["View Tables", "Download Tables"])
-                    
+
                     with view_tab:
-                        # Display tables
-                        for page_num, tables in tables_dict.items():
-                            if tables:  # Only show pages with tables
+                        for page_num, tables in _tables_dict.items():
+                            if tables:
                                 st.subheader(f"Page {page_num}")
                                 for i, table in enumerate(tables):
                                     if table is not None and not table.empty:
-                                        # Fix any duplicate columns before display
                                         display_table = prepare_table_for_display(table)
-                                        
                                         st.write(f"**Table {i+1}**")
                                         st.dataframe(display_table)
                                         st.write("---")
-                    
+
                     with download_tab:
-                        # Multi-sheet Excel: all tables in one file, each table = one sheet
-                        multi_xl_trad = io.BytesIO()
-                        with pd.ExcelWriter(multi_xl_trad, engine='openpyxl') as writer:
-                            trad_sn = {}
-                            for page_num, tbls in tables_dict.items():
+                        # ── Single Excel file, one sheet per table ──────────────────
+                        _multi_xl = io.BytesIO()
+                        with pd.ExcelWriter(_multi_xl, engine='openpyxl') as _writer:
+                            _sn_map: dict = {}
+                            for page_num, tbls in _tables_dict.items():
                                 for tbl in tbls:
                                     if tbl is not None and not tbl.empty:
-                                        base = f"Pg{page_num}_Tbl"
-                                        trad_sn[base] = trad_sn.get(base, 0) + 1
-                                        sn = f"{base}{trad_sn[base]}"[:31]
-                                        prepare_table_for_display(tbl).to_excel(writer, index=False, sheet_name=sn)
+                                        _base = f"Pg{page_num}_Tbl"
+                                        _sn_map[_base] = _sn_map.get(_base, 0) + 1
+                                        _sn = f"{_base}{_sn_map[_base]}"[:31]
+                                        prepare_table_for_display(tbl).to_excel(
+                                            _writer, index=False, sheet_name=_sn)
                         st.download_button(
-                            label=f"⬇ Download ALL {total_tables} Tables as Excel (multi-sheet)",
-                            data=multi_xl_trad.getvalue(),
+                            label=f"⬇ Download ALL {_total_tables} Tables as Excel (multi-sheet)",
+                            data=_multi_xl.getvalue(),
                             file_name="extracted_all_tables.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="trad_multi_xl_btn"
                         )
                         st.write("---")
 
-                        # Create a temporary directory for saving files
-                        with tempfile.TemporaryDirectory() as tmp_dir:
-                            # Prepare tables for saving (fix duplicate columns)
-                            fixed_tables_dict = {}
-                            for page_num, tables in tables_dict.items():
-                                fixed_tables_dict[page_num] = [prepare_table_for_display(table) for table in tables if table is not None and not table.empty]
-
-                            saved_files = extractor.save_tables(
-                                fixed_tables_dict, 
-                                tmp_dir, 
-                                format=output_format.lower(), 
-                                prefix='table'
-                            )
-                            
-                            # Create download buttons for each file
-                            if saved_files:
-                                st.subheader("Download Extracted Tables")
-                                for file_path in saved_files:
-                                    file_name = os.path.basename(file_path)
-                                    with open(file_path, "rb") as file:
-                                        file_bytes = file.read()
-                                        
-                                    # Create download button
-                                    download_button_str = f"Download {file_name}"
-                                    st.download_button(
-                                        label=download_button_str,
-                                        data=file_bytes,
-                                        file_name=file_name,
-                                        mime={
-                                            'csv': 'text/csv',
-                                            'excel': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                            'json': 'application/json'
-                                        }[output_format.lower()]
-                                    )
-                                    
+                        # ── Individual per-table downloads ──────────────────────────
+                        st.subheader("Download Individual Tables")
+                        _tbl_seq = 0
+                        for page_num, tbls in _tables_dict.items():
+                            for tbl in tbls:
+                                if tbl is not None and not tbl.empty:
+                                    _tbl_seq += 1
+                                    _dtbl = prepare_table_for_display(tbl)
+                                    st.write(f"**Page {page_num} – Table {_tbl_seq}**")
+                                    c1, c2 = st.columns(2)
+                                    with c1:
+                                        st.download_button(
+                                            label="Download CSV",
+                                            data=_dtbl.to_csv(index=False).encode('utf-8'),
+                                            file_name=f"table_pg{page_num}_t{_tbl_seq}.csv",
+                                            mime="text/csv",
+                                            key=f"trad_csv_{page_num}_{_tbl_seq}"
+                                        )
+                                    with c2:
+                                        _xl_s = io.BytesIO()
+                                        with pd.ExcelWriter(_xl_s, engine='openpyxl') as _w:
+                                            _dtbl.to_excel(_w, index=False, sheet_name="Table")
+                                        st.download_button(
+                                            label="Download Excel",
+                                            data=_xl_s.getvalue(),
+                                            file_name=f"table_pg{page_num}_t{_tbl_seq}.xlsx",
+                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                            key=f"trad_xlsx_{page_num}_{_tbl_seq}"
+                                        )
                                     st.write("---")
-                            else:
-                                st.warning("No files were generated. No tables were found or the extraction failed.")
                 else:
                     st.warning("No tables were found in the PDF. Try adjusting the extraction options or try a different PDF.")
         
@@ -1622,16 +1642,18 @@ with st.container():
                 
                 return page_data, ocr_result
             
-            # Function to process LLM extraction (supports single page and all pages)
-            def process_llm_extraction(model_name, api_function):
-                all_extracted = []  # list of (page_num, table_df)
+            # ── Helper: run LLM extraction and persist results in session_state ────────
+            def process_llm_extraction(model_name, api_function, state_key):
+                """Extract tables via LLM for all selected pages; store results in session_state."""
+                all_extracted = []      # list of (page_num, DataFrame)
                 all_markdown_parts = []
 
                 progress_bar_llm = st.progress(0)
                 status_llm = st.empty()
 
                 for p_idx, page_num in enumerate(llm_pages_to_process):
-                    status_llm.info(f"Processing page {page_num}/{len(llm_pages_to_process)} with {model_name}...")
+                    status_llm.info(
+                        f"Processing page {page_num}/{len(llm_pages_to_process)} with {model_name}...")
                     progress_bar_llm.progress(p_idx / max(len(llm_pages_to_process), 1))
 
                     page_item = get_pdf_page_as_image(pdf_path, page_num, dpi=dpi)
@@ -1647,7 +1669,7 @@ with st.container():
                         st.image(page_item["image_bytes"], caption=f"Page {page_num}")
 
                     pdf_text = page_item["text"]
-                    ocr_res = perform_ocr_on_image(page_item["image"], lang=ocr_language)
+                    ocr_res  = perform_ocr_on_image(page_item["image"], lang=ocr_language)
                     ocr_text = ocr_res["text"]
 
                     if len(llm_pages_to_process) == 1:
@@ -1663,8 +1685,7 @@ with st.container():
                     result = api_function(llm_prompt, pdf_text, ocr_text)
 
                     if not result.startswith(model_name.split()[0] + " API Error:"):
-                        page_tables = extract_markdown_tables(result)
-                        for t in page_tables:
+                        for t in extract_markdown_tables(result):
                             all_extracted.append((page_num, t))
                         all_markdown_parts.append(f"\n\n### Page {page_num}\n\n{result}")
                     else:
@@ -1672,54 +1693,73 @@ with st.container():
 
                 progress_bar_llm.progress(1.0)
                 total_nums = count_numbers_in_text("\n".join(all_markdown_parts))
-                status_llm.success(f"Completed {len(llm_pages_to_process)} page(s). Found {len(all_extracted)} table(s) with {total_nums} numerical values.")
+                status_llm.success(
+                    f"Completed {len(llm_pages_to_process)} page(s). "
+                    f"Found {len(all_extracted)} table(s) with {total_nums} numerical values.")
+
+                # Persist so download-button reruns keep the results
+                st.session_state[state_key] = {
+                    'all_extracted': all_extracted,
+                    'all_markdown_parts': all_markdown_parts,
+                    'model_name': model_name,
+                }
+
+            # ── Helper: render persisted LLM results (called every rerun) ────────────
+            def display_llm_results(state_key):
+                if state_key not in st.session_state:
+                    return
+                data          = st.session_state[state_key]
+                all_extracted = data['all_extracted']
+                all_md_parts  = data['all_markdown_parts']
+                model_name    = data['model_name']
 
                 if all_extracted:
-                    # Multi-sheet Excel: each table in its own sheet
-                    multi_xl = io.BytesIO()
-                    with pd.ExcelWriter(multi_xl, engine='openpyxl') as writer:
-                        sn_counts = {}
+                    # Single Excel, one sheet per table
+                    _xl = io.BytesIO()
+                    with pd.ExcelWriter(_xl, engine='openpyxl') as _w:
+                        _sn: dict = {}
                         for pg, tbl in all_extracted:
-                            base = f"Pg{pg}_Tbl"
-                            sn_counts[base] = sn_counts.get(base, 0) + 1
-                            sn = f"{base}{sn_counts[base]}"[:31]
-                            prepare_table_for_display(tbl).to_excel(writer, index=False, sheet_name=sn)
+                            _base = f"Pg{pg}_Tbl"
+                            _sn[_base] = _sn.get(_base, 0) + 1
+                            _sheet = f"{_base}{_sn[_base]}"[:31]
+                            prepare_table_for_display(tbl).to_excel(
+                                _w, index=False, sheet_name=_sheet)
                     st.download_button(
                         label=f"⬇ Download ALL {len(all_extracted)} Tables as Excel (multi-sheet)",
-                        data=multi_xl.getvalue(),
+                        data=_xl.getvalue(),
                         file_name=f"{model_name.replace(' ', '_')}_all_tables.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"multi_xl_{model_name.replace(' ','_')}_btn"
+                        key=f"multi_xl_{state_key}_btn"
                     )
                     st.write("---")
+
                     for t_idx, (pg, tbl) in enumerate(all_extracted):
-                        st.write(f"**Page {pg} - Table {t_idx+1}**")
-                        display_tbl = prepare_table_for_display(tbl)
-                        st.dataframe(display_tbl)
+                        st.write(f"**Page {pg} – Table {t_idx+1}**")
+                        _dtbl = prepare_table_for_display(tbl)
+                        st.dataframe(_dtbl)
                         c1, c2 = st.columns(2)
                         with c1:
-                            csv_d = display_tbl.to_csv(index=False).encode('utf-8')
                             st.download_button(
                                 label="Download CSV",
-                                data=csv_d,
+                                data=_dtbl.to_csv(index=False).encode('utf-8'),
                                 file_name=f"{model_name.replace(' ','_')}_pg{pg}_t{t_idx+1}.csv",
                                 mime="text/csv",
-                                key=f"csv_{model_name.replace(' ','_')}_{pg}_{t_idx}"
+                                key=f"csv_{state_key}_{pg}_{t_idx}"
                             )
                         with c2:
-                            xl_single = io.BytesIO()
-                            with pd.ExcelWriter(xl_single, engine='openpyxl') as w2:
-                                display_tbl.to_excel(w2, index=False, sheet_name="Table")
+                            _xl_s = io.BytesIO()
+                            with pd.ExcelWriter(_xl_s, engine='openpyxl') as _w2:
+                                _dtbl.to_excel(_w2, index=False, sheet_name="Table")
                             st.download_button(
                                 label="Download Excel",
-                                data=xl_single.getvalue(),
+                                data=_xl_s.getvalue(),
                                 file_name=f"{model_name.replace(' ','_')}_pg{pg}_t{t_idx+1}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key=f"xlsx_{model_name.replace(' ','_')}_{pg}_{t_idx}"
+                                key=f"xlsx_{state_key}_{pg}_{t_idx}"
                             )
                         st.write("---")
                 else:
-                    combined_md = "\n".join(all_markdown_parts)
+                    combined_md = "\n".join(all_md_parts)
                     if combined_md:
                         st.warning("No structured tables extracted. Showing raw output:")
                         st.markdown(combined_md)
@@ -1728,29 +1768,33 @@ with st.container():
                             data=combined_md.encode('utf-8'),
                             file_name=f"{model_name.replace(' ', '_')}_raw_output.txt",
                             mime="text/plain",
-                            key=f"raw_{model_name.replace(' ','_')}_btn"
+                            key=f"raw_{state_key}_btn"
                         )
-            
-            # Handle LLM extraction button clicks
+
+            # ── Handle LLM extraction button clicks ───────────────────────────────────
             if extract_openai_button:
-                process_llm_extraction("OpenAI GPT-4o", call_openai_api)
-                
+                st.session_state.pop('llm_openai', None)
+                process_llm_extraction("OpenAI GPT-4o", call_openai_api, 'llm_openai')
+
+            display_llm_results('llm_openai')
+
             if extract_anthropic_button:
-                # Check if using direct image processing or text-based processing
+                st.session_state.pop('llm_claude', None)
                 if st.session_state.use_direct_image:
                     selected_dpi_claude = st.session_state.get('selected_dpi', 200)
-                    all_claude_tables = []  # list of (page_num, table_df)
-                    all_claude_md = []
+                    all_claude_tables = []
+                    all_claude_md     = []
 
                     progress_claude = st.progress(0)
-                    status_claude = st.empty()
+                    status_claude   = st.empty()
 
                     for p_idx, page_num in enumerate(llm_pages_to_process):
-                        status_claude.info(f"Processing page {page_num}/{len(llm_pages_to_process)} with Claude (Direct Image)...")
+                        status_claude.info(
+                            f"Processing page {page_num}/{len(llm_pages_to_process)} "
+                            f"with Claude (Direct Image)...")
                         progress_claude.progress(p_idx / max(len(llm_pages_to_process), 1))
 
                         page_data = get_pdf_page_as_image(pdf_path, page_num, dpi=selected_dpi_claude)
-
                         if isinstance(page_data, tuple):
                             st.warning(f"Page {page_num}: {page_data[1] if len(page_data) > 1 else 'Error'}")
                             continue
@@ -1763,77 +1807,41 @@ with st.container():
                             st.image(page_data["image_bytes"], caption=f"Page {page_num}")
 
                         result = call_anthropic_api(llm_prompt, "", None, page_data["image"])
-
                         if result.startswith("Anthropic API Error:"):
                             st.warning(f"Page {page_num}: {result}")
                         else:
-                            page_tables = extract_markdown_tables(result)
-                            for t in page_tables:
+                            for t in extract_markdown_tables(result):
                                 all_claude_tables.append((page_num, t))
                             all_claude_md.append(f"\n\n### Page {page_num}\n\n{result}")
 
                     progress_claude.progress(1.0)
                     total_claude_nums = count_numbers_in_text("\n".join(all_claude_md))
-                    status_claude.success(f"Completed {len(llm_pages_to_process)} page(s). Found {len(all_claude_tables)} table(s) with {total_claude_nums} numerical values.")
+                    status_claude.success(
+                        f"Completed {len(llm_pages_to_process)} page(s). "
+                        f"Found {len(all_claude_tables)} table(s) with {total_claude_nums} numerical values.")
 
-                    if all_claude_tables:
-                        # Multi-sheet Excel download
-                        multi_xl_claude = io.BytesIO()
-                        with pd.ExcelWriter(multi_xl_claude, engine='openpyxl') as writer:
-                            sn_cnt = {}
-                            for pg, tbl in all_claude_tables:
-                                base = f"Pg{pg}_Tbl"
-                                sn_cnt[base] = sn_cnt.get(base, 0) + 1
-                                sn = f"{base}{sn_cnt[base]}"[:31]
-                                prepare_table_for_display(tbl).to_excel(writer, index=False, sheet_name=sn)
-                        st.download_button(
-                            label=f"⬇ Download ALL {len(all_claude_tables)} Tables as Excel (multi-sheet)",
-                            data=multi_xl_claude.getvalue(),
-                            file_name="Claude_all_tables.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="claude_multi_xl_btn"
-                        )
-                        st.write("---")
-                        for t_idx, (pg, tbl) in enumerate(all_claude_tables):
-                            st.write(f"**Page {pg} - Table {t_idx+1}**")
-                            display_tbl = prepare_table_for_display(tbl)
-                            st.dataframe(display_tbl)
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                csv_d = display_tbl.to_csv(index=False).encode('utf-8')
-                                st.download_button(
-                                    label="Download CSV",
-                                    data=csv_d,
-                                    file_name=f"Claude_pg{pg}_t{t_idx+1}.csv",
-                                    mime="text/csv",
-                                    key=f"claude_csv_{pg}_{t_idx}"
-                                )
-                            with c2:
-                                xl_s = io.BytesIO()
-                                with pd.ExcelWriter(xl_s, engine='openpyxl') as w2:
-                                    display_tbl.to_excel(w2, index=False, sheet_name="Table")
-                                st.download_button(
-                                    label="Download Excel",
-                                    data=xl_s.getvalue(),
-                                    file_name=f"Claude_pg{pg}_t{t_idx+1}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"claude_xlsx_{pg}_{t_idx}"
-                                )
-                            st.write("---")
-                    else:
-                        combined_claude_md = "\n".join(all_claude_md)
-                        if combined_claude_md:
-                            st.warning("No structured tables found. Showing raw output:")
-                            st.markdown(combined_claude_md)
+                    # Persist
+                    st.session_state['llm_claude'] = {
+                        'all_extracted': all_claude_tables,
+                        'all_markdown_parts': all_claude_md,
+                        'model_name': 'Anthropic Claude',
+                    }
                 else:
-                    # Use the text-based processing
-                    process_llm_extraction("Anthropic Claude", call_anthropic_api)
-                
+                    process_llm_extraction("Anthropic Claude", call_anthropic_api, 'llm_claude')
+
+            display_llm_results('llm_claude')
+
             if extract_gemini_button:
-                process_llm_extraction("Google Gemini", call_gemini_api)
-                
+                st.session_state.pop('llm_gemini', None)
+                process_llm_extraction("Google Gemini", call_gemini_api, 'llm_gemini')
+
+            display_llm_results('llm_gemini')
+
             if extract_deepseek_button:
-                process_llm_extraction("DeepSeek", call_deepseek_api)
+                st.session_state.pop('llm_deepseek', None)
+                process_llm_extraction("DeepSeek", call_deepseek_api, 'llm_deepseek')
+
+            display_llm_results('llm_deepseek')
         
                 
         # Clean up the temporary file when done
